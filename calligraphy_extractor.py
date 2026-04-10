@@ -282,12 +282,16 @@ class CalligraphyExtractor:
             value=(0, 0, 0, 0)
         )
 
-    def process_image(self, image_path: str) -> int:
+    def process_image(self, image_path: str,
+                      save_original_color: bool = False,
+                      color_suffix: str = "_color") -> int:
         """
         处理单张书法图像
 
         Args:
             image_path: 图像路径 (支持中文路径)
+            save_original_color: 是否保存原图彩色版本
+            color_suffix: 彩色版本文件名的后缀
 
         Returns:
             成功提取的单字数量
@@ -340,11 +344,11 @@ class CalligraphyExtractor:
             # 提取 ROI
             roi_gray = gray_original[y:y+ch, x:x+cw]
 
-            # 生成 Alpha 通道 BGRA 图像
+            # 生成 Alpha 通道 BGRA 图像 (灰度版)
             bgra_char = self._create_alpha_channel(roi_gray)
             bgra_padded = self._pad_bgra(bgra_char)
 
-            # 保存
+            # 保存灰度版本
             char_id = uuid.uuid4().hex[:8]
             filename = f"char_{char_id}.{self.config.output_format}"
             filepath = os.path.join(self.output_dir, filename)
@@ -357,13 +361,21 @@ class CalligraphyExtractor:
                 ))
                 extracted_count += 1
 
+            # 保存原图彩色版本
+            if save_original_color:
+                roi_color = img[y:y+ch, x:x+cw]
+                color_filename = f"char_{char_id}{color_suffix}.{self.config.output_format}"
+                color_filepath = os.path.join(self.output_dir, color_filename)
+                cv2.imwrite(color_filepath, roi_color)
+
         self._log(f"[+] 提取完成！共成功分割 {extracted_count} 个单字。")
 
         return extracted_count
 
     def process_batch(self, image_paths: List[str],
                       parallel: bool = False,
-                      workers: int = 4) -> Dict[str, int]:
+                      workers: int = 4,
+                      save_original_color: bool = False) -> Dict[str, int]:
         """
         批量处理多张图像
 
@@ -371,6 +383,7 @@ class CalligraphyExtractor:
             image_paths: 图像路径列表
             parallel: 是否并行处理
             workers: 并行 worker 数量
+            save_original_color: 是否保存原图彩色版本
 
         Returns:
             字典，key 为图像路径，value 为提取数量
@@ -380,7 +393,7 @@ class CalligraphyExtractor:
             results = {}
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_path = {
-                    executor.submit(self.process_image, p): p
+                    executor.submit(self.process_image, p, save_original_color): p
                     for p in image_paths
                 }
                 for future in as_completed(future_to_path):
@@ -392,7 +405,7 @@ class CalligraphyExtractor:
                         results[path] = 0
             return results
         else:
-            return {p: self.process_image(p) for p in image_paths}
+            return {p: self.process_image(p, save_original_color) for p in image_paths}
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -482,6 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
     parser.add_argument("--parallel", action="store_true", help="并行处理")
     parser.add_argument("--workers", type=int, default=4, help="并行 worker 数")
+    parser.add_argument("--color", action="store_true", help="同时保存原图彩色版本")
 
     args = parser.parse_args()
 
@@ -502,7 +516,7 @@ if __name__ == "__main__":
 
     if input_path.is_file():
         try:
-            extractor.process_image(str(input_path))
+            extractor.process_image(str(input_path), save_original_color=args.color)
         except Exception as e:
             print(f"[!] Error: {e}")
 
@@ -517,7 +531,7 @@ if __name__ == "__main__":
             print(f"[!] 在 {input_path} 中未找到图像文件")
         else:
             print(f"[*] 找到 {len(image_files)} 张图像")
-            results = extractor.process_batch(image_files, parallel=args.parallel, workers=args.workers)
+            results = extractor.process_batch(image_files, parallel=args.parallel, workers=args.workers, save_original_color=args.color)
             for path, count in results.items():
                 print(f"    {path}: {count} 个单字")
     else:
