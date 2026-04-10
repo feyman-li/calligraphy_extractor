@@ -48,6 +48,7 @@ class MorphologyOperation(Enum):
     """形态学操作枚举"""
     DILATE = "dilate"
     ERODE = "erode"
+    CLOSE = "close"  # 闭运算：先膨胀后腐蚀，连接靠近的区域
     NONE = "none"
 
 
@@ -61,9 +62,12 @@ class PipelineConfig:
     max_aspect_ratio: float = 5.0
 
     # 形态学处理
-    morph_kernel_size: Tuple[int, int] = (3, 3)
-    morph_operation: MorphologyOperation = MorphologyOperation.DILATE
-    morph_iterations: int = 1
+    morph_kernel_size: Tuple[int, int] = (5, 5)  # 增大核尺寸，连接更远的偏旁
+    morph_operation: MorphologyOperation = MorphologyOperation.CLOSE
+    morph_iterations: int = 2
+
+    # 裁剪扩展
+    crop_margin: int = 3  # 裁剪时扩展像素数，防止边缘被截断
 
     # 二值化
     binarization_method: BinarizationMethod = BinarizationMethod.OTSU
@@ -223,6 +227,10 @@ class CalligraphyExtractor:
             return cv2.dilate(binary, kernel, iterations=self.config.morph_iterations)
         elif operation == MorphologyOperation.ERODE:
             return cv2.erode(binary, kernel, iterations=self.config.morph_iterations)
+        elif operation == MorphologyOperation.CLOSE:
+            # 闭运算：先膨胀后腐蚀，填充内部空洞，连接靠近的区域
+            dilated = cv2.dilate(binary, kernel, iterations=self.config.morph_iterations)
+            return cv2.erode(dilated, kernel, iterations=self.config.morph_iterations)
         else:
             return binary
 
@@ -341,8 +349,15 @@ class CalligraphyExtractor:
 
             x, y, cw, ch = cv2.boundingRect(cnt)
 
+            # 扩展裁剪区域，防止边缘被截断
+            margin = self.config.crop_margin
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(img.shape[1], x + cw + margin)
+            y2 = min(img.shape[0], y + ch + margin)
+
             # 提取 ROI
-            roi_gray = gray_original[y:y+ch, x:x+cw]
+            roi_gray = gray_original[y1:y2, x1:x2]
 
             # 生成 Alpha 通道 BGRA 图像 (灰度版)
             bgra_char = self._create_alpha_channel(roi_gray)
@@ -363,7 +378,7 @@ class CalligraphyExtractor:
 
             # 保存原图彩色版本
             if save_original_color:
-                roi_color = img[y:y+ch, x:x+cw]
+                roi_color = img[y1:y2, x1:x2]
                 color_filename = f"char_{char_id}{color_suffix}.{self.config.output_format}"
                 color_filepath = os.path.join(self.output_dir, color_filename)
                 cv2.imwrite(color_filepath, roi_color)
