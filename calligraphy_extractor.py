@@ -512,6 +512,13 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=4, help="并行 worker 数")
     parser.add_argument("--color", action="store_true", help="同时保存原图彩色版本")
 
+    # OCR 自动打标参数
+    parser.add_argument("--ocr", action="store_true", help="启用 OCR 自动打标")
+    parser.add_argument("--ocr-model", help="OCR ONNX 模型路径")
+    parser.add_argument("--ocr-dict", help="OCR 字典文件路径")
+    parser.add_argument("--author", default="未知", help="作者姓名")
+    parser.add_argument("--work", default="未知", help="作品名称")
+
     args = parser.parse_args()
 
     # 加载配置
@@ -526,12 +533,87 @@ if __name__ == "__main__":
         verbose=args.verbose
     )
 
+    # 初始化 OCR (如果启用)
+    ocr_tagger = None
+    metadata_gen = None
+    if args.ocr:
+        if not args.ocr_model or not os.path.exists(args.ocr_model):
+            print("[!] OCR 模式需要指定有效的模型路径 (--ocr-model)")
+            print("[*] 请从 PaddleOCR 下载: https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar")
+            exit(1)
+
+        try:
+            from ocr_auto_tagger import OcrAutoTagger, MetadataGenerator
+            ocr_tagger = OcrAutoTagger(
+                onnx_model_path=args.ocr_model,
+                dict_path=args.ocr_dict,
+                use_opencv_dnn=True
+            )
+            metadata_gen = MetadataGenerator(
+                author=args.author,
+                work_name=args.work,
+                output_dir=args.output
+            )
+            print(f"[*] OCR 已启用: {args.ocr_model}")
+        except ImportError:
+            print("[!] 请安装 onnxruntime: pip install onnxruntime")
+            exit(1)
+
     # 判断输入是文件还是目录
     input_path = Path(args.input)
 
+    def process_with_ocr(extractor, image_path, ocr_tagger, metadata_gen, save_color):
+        """处理单张图像并生成 OCR 元数据"""
+        count = extractor.process_image(image_path, save_original_color=save_color)
+
+        if ocr_tagger and metadata_gen:
+            char_counter = 1
+            for result in extractor.results:
+                # OCR 识别
+                ocr_result = ocr_tagger.recognize(result.image)
+
+                # 生成新文件名: 作者_作品_字_序号.png
+                char_label = ocr_result.text if ocr_result.confidence > 0.5 else "待确认"
+                new_basename = f"{args.author}_{args.work}_{char_label}_{char_counter:03d}"
+                char_counter += 1
+
+                # 更新结果中的文件名
+                result.char_id = new_basename
+
+                # 生成元数据
+                metadata = metadata_gen.generate(
+                    char_img=result.image,
+                    ocr_result=ocr_result,
+                    bbox=result.bbox,
+                    image_path=result.image_path
+                )
+                metadata["char_id"] = new_basename
+
+                # 保存 JSON
+                json_path = os.path.join(args.output, new_basename + ".json")
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=4)
+
+                # 重命名图像文件
+                old_path = result.image_path
+                new_path = os.path.join(args.output, new_basename + ".png")
+                if os.path.exists(old_path) and old_path != new_path:
+                    os.rename(old_path, new_path)
+                    result.image_path = new_path
+
+                # 重命名彩色版本
+                if save_color:
+                    old_color_path = old_path.replace(".png", "_color.png")
+                    new_color_path = new_path.replace(".png", "_color.png")
+                    if os.path.exists(old_color_path):
+                        os.rename(old_color_path, new_color_path)
+
+        return count
+
     if input_path.is_file():
         try:
-            extractor.process_image(str(input_path), save_original_color=args.color)
+            count = process_with_ocr(extractor, str(input_path), ocr_tagger, metadata_gen, args.color)
+            print(f"[*] 处理完成，提取 {count} 个单字")
         except Exception as e:
             print(f"[!] Error: {e}")
 
@@ -547,6 +629,8 @@ if __name__ == "__main__":
         else:
             print(f"[*] 找到 {len(image_files)} 张图像")
             results = extractor.process_batch(image_files, parallel=args.parallel, workers=args.workers, save_original_color=args.color)
+            for path, count in results.items():
+                print(f"    {path}: {count} 个单字")
             for path, count in results.items():
                 print(f"    {path}: {count} 个单字")
     else:
