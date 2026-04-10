@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/RAMBO/AppData/Roaming/Python/Python313/site-packages/paddleocr/**)"
+    ]
+  }
+}

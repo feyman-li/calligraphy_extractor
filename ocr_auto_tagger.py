@@ -2,10 +2,15 @@
 OcrAutoTagger: 书法单字 OCR 自动打标模块
 ==========================================
 
-使用 OpenCV DNN 加载 ONNX 模型进行轻量级字符识别
+支持两种推理后端:
+1. ONNX Runtime (推荐): 使用 OpenCV DNN 或 onnxruntime 加载 ONNX 模型
+2. PaddleOCR Native: 直接使用 PaddleOCR Python API
 
-依赖:
+依赖 (ONNX模式):
     pip install opencv-python numpy onnxruntime
+
+依赖 (PaddleOCR模式):
+    pip install paddleocr paddlepaddle
 
 Author: Industrial CV Pipeline
 Date: 2026-04-10
@@ -15,7 +20,7 @@ import cv2
 import numpy as np
 import os
 import json
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,50 +36,76 @@ class OcrAutoTagger:
     """
     轻量级书法单字识别器
 
-    使用 OpenCV DNN 或 ONNXRuntime 加载 PaddleOCR 识别模型，
-    支持 CTC 解码，推理速度每秒数百字。
+    支持两种模式:
+    1. ONNX模式: 使用 OpenCV DNN 或 ONNXRuntime 加载导出的 ONNX 模型
+    2. PaddleOCR模式: 直接使用 PaddleOCR 原生 API (自动下载模型)
     """
 
     def __init__(self,
-                 onnx_model_path: str,
+                 model_path: Optional[str] = None,
                  dict_path: Optional[str] = None,
-                 use_opencv_dnn: bool = True,
-                 confidence_threshold: float = 0.5):
+                 use_onnx: bool = True,
+                 use_opencv_dnn: bool = False,
+                 confidence_threshold: float = 0.5,
+                 lang: str = 'ch'):
         """
         初始化 OCR 识别器
 
         Args:
-            onnx_model_path: ONNX 模型文件路径
-            dict_path: 字典文件路径 (PaddleOCR ppocr_keys_v1.txt)
-            use_opencv_dnn: True=使用OpenCV DNN, False=使用ONNXRuntime
-            confidence_threshold: 置信度阈值，低于此值标记为"待确认"
+            model_path: ONNX 模型文件路径 (ONNX模式)
+            dict_path: 字典文件路径 (ONNX模式, PaddleOCR ppocr_keys_v1.txt)
+            use_onnx: True=使用ONNX模式, False=使用PaddleOCR原生API
+            use_opencv_dnn: True=使用OpenCV DNN (ONNX模式), False=使用ONNXRuntime
+            confidence_threshold: 置信度阈值
+            lang: 语言选项 ('ch' for Chinese)
         """
         self.confidence_threshold = confidence_threshold
+        self.use_onnx = use_onnx
         self.vocabulary: List[str] = []
 
-        # 加载字典
-        if dict_path and os.path.exists(dict_path):
-            self._load_dict(dict_path)
-        else:
-            # 使用默认汉字字典 (常用汉字 6753 个)
-            self._init_default_dict()
+        if use_onnx:
+            # ONNX 模式
+            if not model_path or not os.path.exists(model_path):
+                raise FileNotFoundError(f"ONNX模型文件不存在: {model_path}")
 
-        # 加载模型
-        if use_opencv_dnn:
-            self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
-            self.use_opencv = True
+            # 加载字典
+            if dict_path and os.path.exists(dict_path):
+                self._load_dict(dict_path)
+            else:
+                self._init_default_dict()
+
+            # 加载模型
+            if use_opencv_dnn:
+                self.net = cv2.dnn.readNetFromONNX(model_path)
+                self.use_opencv = True
+                self.session = None
+            else:
+                import onnxruntime as ort
+                sess_options = ort.SessionOptions()
+                sess_options.intra_op_num_threads = 4
+                self.session = ort.InferenceSession(
+                    model_path,
+                    sess_options,
+                    providers=['CPUExecutionProvider']
+                )
+                self.input_name = self.session.get_inputs()[0].name
+                self.use_opencv = False
         else:
-            # ONNXRuntime
-            import onnxruntime as ort
-            sess_options = ort.SessionOptions()
-            sess_options.intra_op_num_threads = 4
-            self.session = ort.InferenceSession(
-                onnx_model_path,
-                sess_options,
-                providers=['CPUExecutionProvider']
-            )
-            self.input_name = self.session.get_inputs()[0].name
-            self.use_opencv = False
+            # PaddleOCR 原生模式
+            try:
+                from paddleocr import PaddleOCR
+                self.paddle_ocr = PaddleOCR(
+                    use_angle_cls=True,
+                    lang=lang,
+                    use_gpu=False,
+                    show_log=False
+                )
+                self.use_opencv = False
+                self.session = None
+            except ImportError:
+                raise ImportError(
+                    "PaddleOCR 未安装。请运行: pip install paddleocr paddlepaddle"
+                )
 
     def _load_dict(self, dict_path: str):
         """加载字典文件"""
@@ -88,7 +119,6 @@ class OcrAutoTagger:
 
     def _init_default_dict(self):
         """初始化默认汉字字典 (常用字)"""
-        # 常用汉字字典，来自 PaddleOCR
         common_chars = (
             "的一是不了在人我有他这中大来上个国们为上 "
             "地到方以就出要年时得才可下过量起政好小部其此"
@@ -98,26 +128,12 @@ class OcrAutoTagger:
         self.vocabulary = ['blank'] + list(common_chars) + [' ']
 
     def _preprocess(self, char_img: np.ndarray) -> Tuple[np.ndarray, float, int]:
-        """
-        预处理单字图像
-
-        PaddleOCR 标准预处理:
-        1. 高度缩放为 48，宽度等比例缩放
-        2. 归一化: (x * 2.0 / 255.0) - 1.0
-
-        Returns:
-            blob: 预处理后的 blob
-            scale: 缩放比例
-            target_width: 目标宽度
-        """
+        """预处理单字图像"""
         h = 48
         w = max(48, int(char_img.shape[1] * (48.0 / char_img.shape[0])))
 
-        # 调整大小
         resized = cv2.resize(char_img, (w, h))
 
-        # 归一化并转换为 blob
-        # PaddleOCR 归一化: (x / 127.5) - 1.0
         blob = cv2.dnn.blobFromImage(
             resized,
             scalefactor=1/127.5,
@@ -130,21 +146,12 @@ class OcrAutoTagger:
         return blob, 48.0 / h, w
 
     def _ctc_decode_greedy(self, net_output: np.ndarray) -> OcrResult:
-        """
-        CTC 贪心解码
-
-        Args:
-            net_output: 模型输出，维度 [1, T, vocab_size]
-
-        Returns:
-            OcrResult: 识别结果和置信度
-        """
-        # net_output shape: (1, time_steps, vocab_size)
+        """CTC 贪心解码"""
         if len(net_output.shape) == 4:
-            net_output = net_output.squeeze(0)  # (T, vocab_size)
+            net_output = net_output.squeeze(0)
 
         time_steps, vocab_size = net_output.shape
-        data = net_output  # (T, vocab_size)
+        data = net_output
 
         result_text = ""
         total_confidence = 0.0
@@ -152,13 +159,9 @@ class OcrAutoTagger:
         last_index = -1
 
         for t in range(time_steps):
-            # 找到当前时间步概率最大的字符索引
             max_idx = np.argmax(data[t])
             max_prob = float(data[t, max_idx])
 
-            # CTC 规则:
-            # 1. 忽略空白标签 (索引 0)
-            # 2. 忽略重复标签
             if max_idx > 0 and max_idx != last_index:
                 if max_idx < len(self.vocabulary):
                     result_text += self.vocabulary[max_idx]
@@ -184,19 +187,47 @@ class OcrAutoTagger:
         Returns:
             OcrResult: 识别结果
         """
-        # 预处理
+        if self.use_onnx:
+            return self._recognize_onnx(char_img)
+        else:
+            return self._recognize_paddle(char_img)
+
+    def _recognize_onnx(self, char_img: np.ndarray) -> OcrResult:
+        """ONNX 模式识别"""
         blob, scale, target_w = self._preprocess(char_img)
 
         if self.use_opencv:
             self.net.setInput(blob)
             output = self.net.forward()
         else:
-            output = self.session.run(
-                None,
-                {self.input_name: blob}
-            )[0]
+            output = self.session.run(None, {self.input_name: blob})[0]
 
         return self._ctc_decode_greedy(output)
+
+    def _recognize_paddle(self, char_img: np.ndarray) -> OcrResult:
+        """PaddleOCR 原生模式识别"""
+        # 转换为 BGR 如果是灰度图
+        if len(char_img.shape) == 2:
+            char_img = cv2.cvtColor(char_img, cv2.COLOR_GRAY2BGR)
+
+        # PaddleOCR 需要图像路径，暂存到临时文件
+        temp_path = '_temp_char_img.png'
+        cv2.imwrite(temp_path, char_img)
+
+        try:
+            result = self.paddle_ocr.ocr(temp_path, cls=True)
+
+            if result and result[0]:
+                text = result[0][0][1][0] if result[0][0] else "未知"
+                confidence = result[0][0][1][1] if result[0][0] else 0.0
+                return OcrResult(text=text, confidence=float(confidence))
+            else:
+                return OcrResult(text="未知", confidence=0.0)
+        except Exception as e:
+            return OcrResult(text="错误", confidence=0.0)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def recognize_batch(self, char_imgs: List[np.ndarray]) -> List[OcrResult]:
         """批量识别"""
@@ -285,43 +316,34 @@ def integrate_ocr_to_extractor():
     """
     演示：如何将 OCR 打标集成到 CalligraphyExtractor
 
-    使用示例：
+    模式1: ONNX 模式 (需要先转换模型)
     ```python
     from calligraphy_extractor import CalligraphyExtractor
     from ocr_auto_tagger import OcrAutoTagger, MetadataGenerator
 
-    # 初始化提取器
     extractor = CalligraphyExtractor(output_dir="output_chars")
 
-    # 初始化 OCR (需要先下载 PaddleOCR 识别模型)
-    # 模型下载地址: https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar
+    # ONNX 模式
     tagger = OcrAutoTagger(
-        onnx_model_path="ch_PP-OCRv4_rec_infer.onnx",
-        dict_path="ppocr_keys_v1.txt"
+        model_path="ch_PP-OCRv4_rec.onnx",
+        dict_path="ppocr_keys_v1.txt",
+        use_onnx=True
     )
 
-    # 初始化元数据生成器
-    metadata_gen = MetadataGenerator(
-        author="苏轼",
-        work_name="祭黄几道文",
-        output_dir="output_chars"
-    )
+    metadata_gen = MetadataGenerator(author="苏轼", work_name="祭黄几道文")
+    ```
 
-    # 处理图像
-    count = extractor.process_image("calligraphy.jpg")
+    模式2: PaddleOCR 原生模式 (自动下载模型)
+    ```python
+    from calligraphy_extractor import CalligraphyExtractor
+    from ocr_auto_tagger import OcrAutoTagger, MetadataGenerator
 
-    # 为每个结果生成元数据
-    for result in extractor.results:
-        ocr_result = tagger.recognize(result.image)
-        metadata = metadata_gen.generate(
-            char_img=result.image,
-            ocr_result=ocr_result,
-            bbox=result.bbox,
-            image_path=result.image_path
-        )
-        # 保存 JSON
-        json_path = result.image_path.replace('.png', '.json')
-        metadata_gen.save_metadata(metadata, json_path)
+    extractor = CalligraphyExtractor(output_dir="output_chars")
+
+    # PaddleOCR 原生模式 (推荐，无需手动转换模型)
+    tagger = OcrAutoTagger(use_onnx=False)
+
+    metadata_gen = MetadataGenerator(author="苏轼", work_name="祭黄几道文")
     ```
     """
     pass
@@ -333,16 +355,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="书法单字 OCR 识别测试")
     parser.add_argument("image", help="单字图像路径")
-    parser.add_argument("-m", "--model", required=True, help="ONNX 模型路径")
+    parser.add_argument("-m", "--model", help="ONNX 模型路径 (可选，不指定则使用PaddleOCR原生)")
     parser.add_argument("-d", "--dict", help="字典文件路径")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
+    parser.add_argument("--onnx", action="store_true", help="强制使用ONNX模式")
 
     args = parser.parse_args()
-
-    if not os.path.exists(args.model):
-        print(f"[!] 模型文件不存在: {args.model}")
-        print("[*] 请从 PaddleOCR 下载: https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar")
-        exit(1)
 
     # 加载图像
     img = cv2.imread(args.image)
@@ -350,15 +368,27 @@ if __name__ == "__main__":
         print(f"[!] 无法读取图像: {args.image}")
         exit(1)
 
-    # 初始化 OCR
-    tagger = OcrAutoTagger(
-        onnx_model_path=args.model,
-        dict_path=args.dict,
-        use_opencv_dnn=True
-    )
+    try:
+        if args.onnx or (args.model and os.path.exists(args.model)):
+            # ONNX 模式
+            tagger = OcrAutoTagger(
+                model_path=args.model,
+                dict_path=args.dict,
+                use_onnx=True,
+                use_opencv_dnn=True
+            )
+            print("[*] 使用 ONNX 模式")
+        else:
+            # PaddleOCR 原生模式
+            tagger = OcrAutoTagger(use_onnx=False)
+            print("[*] 使用 PaddleOCR 原生模式 (会自动下载模型)")
 
-    # 识别
-    result = tagger.recognize(img)
+        # 识别
+        result = tagger.recognize(img)
 
-    print(f"[*] 识别结果: {result.text}")
-    print(f"[*] 置信度: {result.confidence:.4f}")
+        print(f"[*] 识别结果: {result.text}")
+        print(f"[*] 置信度: {result.confidence:.4f}")
+
+    except Exception as e:
+        print(f"[!] 错误: {e}")
+        exit(1)
