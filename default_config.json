@@ -1,0 +1,17 @@
+{
+    "min_area": 500,
+    "max_area": 500000,
+    "min_aspect_ratio": 0.2,
+    "max_aspect_ratio": 5.0,
+    "morph_kernel_size": [3, 3],
+    "morph_operation": "dilate",
+    "morph_iterations": 1,
+    "binarization_method": "otsu",
+    "fixed_threshold": 127,
+    "adaptive_block_size": 11,
+    "adaptive_c": 2,
+    "gaussian_blur_size": [5, 5],
+    "gaussian_sigma": 0.0,
+    "pad_pixels": 10,
+    "output_format": "png"
+}

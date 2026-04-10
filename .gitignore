@@ -1,0 +1,12 @@
+# Output images (generated)
+su_shi_output/
+*_output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.obj
+*.exe
