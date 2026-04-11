@@ -47,7 +47,8 @@ class OcrAutoTagger:
                  use_onnx: bool = True,
                  use_opencv_dnn: bool = False,
                  confidence_threshold: float = 0.5,
-                 lang: str = 'ch'):
+                 lang: str = 'ch',
+                 use_easyocr: bool = False):
         """
         初始化 OCR 识别器
 
@@ -58,10 +59,21 @@ class OcrAutoTagger:
             use_opencv_dnn: True=使用OpenCV DNN (ONNX模式), False=使用ONNXRuntime
             confidence_threshold: 置信度阈值
             lang: 语言选项 ('ch' for Chinese)
+            use_easyocr: True=使用EasyOCR模式 (备用方案)
         """
         self.confidence_threshold = confidence_threshold
         self.use_onnx = use_onnx
+        self.use_easyocr = use_easyocr
         self.vocabulary: List[str] = []
+
+        if use_easyocr:
+            # EasyOCR 模式
+            try:
+                import easyocr
+                self.easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False, verbose=False)
+            except ImportError:
+                raise ImportError("EasyOCR 未安装。请运行: pip install easyocr")
+            return
 
         if use_onnx:
             # ONNX 模式
@@ -187,7 +199,9 @@ class OcrAutoTagger:
         Returns:
             OcrResult: 识别结果
         """
-        if self.use_onnx:
+        if self.use_easyocr:
+            return self._recognize_easyocr(char_img)
+        elif self.use_onnx:
             return self._recognize_onnx(char_img)
         else:
             return self._recognize_paddle(char_img)
@@ -215,19 +229,55 @@ class OcrAutoTagger:
         cv2.imwrite(temp_path, char_img)
 
         try:
-            result = self.paddle_ocr.ocr(temp_path, cls=True)
+            result = self.paddle_ocr.ocr(temp_path)
 
-            if result and result[0]:
+            if result and result[0] and len(result[0]) > 0:
+                # PaddleOCR 返回格式: [[bbox, (text, confidence)]]
                 text = result[0][0][1][0] if result[0][0] else "未知"
                 confidence = result[0][0][1][1] if result[0][0] else 0.0
                 return OcrResult(text=text, confidence=float(confidence))
             else:
                 return OcrResult(text="未知", confidence=0.0)
         except Exception as e:
-            return OcrResult(text="错误", confidence=0.0)
+            # PaddleOCR 可能因环境问题失败，标记为需要人工确认
+            return OcrResult(text="待确认", confidence=0.0)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def _recognize_easyocr(self, char_img: np.ndarray) -> OcrResult:
+        """EasyOCR 模式识别"""
+        try:
+            # 转换为 BGR 如果是灰度图
+            if len(char_img.shape) == 2:
+                char_img = cv2.cvtColor(char_img, cv2.COLOR_GRAY2BGR)
+
+            # 保存临时文件
+            temp_path = '_temp_char_img.png'
+            cv2.imwrite(temp_path, char_img)
+
+            result = self.easyocr_reader.readtext(temp_path)
+
+            if result and len(result) > 0:
+                # EasyOCR 返回: [(bbox, text, confidence), ...]
+                # 取置信度最高的结果
+                best_result = max(result, key=lambda x: x[2])
+                text = best_result[1]
+                confidence = best_result[2]
+
+                # 清理文本，只保留汉字
+                import re
+                chinese_chars = re.findall(r'[\u4e00-\u9fff]', text)
+                text = ''.join(chinese_chars) if chinese_chars else "待确认"
+
+                os.remove(temp_path)
+                return OcrResult(text=text, confidence=float(confidence))
+            else:
+                os.remove(temp_path)
+                return OcrResult(text="未知", confidence=0.0)
+
+        except Exception as e:
+            return OcrResult(text="待确认", confidence=0.0)
 
     def recognize_batch(self, char_imgs: List[np.ndarray]) -> List[OcrResult]:
         """批量识别"""
@@ -355,10 +405,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="书法单字 OCR 识别测试")
     parser.add_argument("image", help="单字图像路径")
-    parser.add_argument("-m", "--model", help="ONNX 模型路径 (可选，不指定则使用PaddleOCR原生)")
+    parser.add_argument("-m", "--model", help="ONNX 模型路径 (可选)")
     parser.add_argument("-d", "--dict", help="字典文件路径")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
     parser.add_argument("--onnx", action="store_true", help="强制使用ONNX模式")
+    parser.add_argument("--easyocr", action="store_true", help="使用EasyOCR模式 (备用方案)")
 
     args = parser.parse_args()
 
@@ -369,7 +420,11 @@ if __name__ == "__main__":
         exit(1)
 
     try:
-        if args.onnx or (args.model and os.path.exists(args.model)):
+        if args.easyocr:
+            # EasyOCR 模式
+            tagger = OcrAutoTagger(use_easyocr=True)
+            print("[*] 使用 EasyOCR 模式")
+        elif args.onnx or (args.model and os.path.exists(args.model)):
             # ONNX 模式
             tagger = OcrAutoTagger(
                 model_path=args.model,
