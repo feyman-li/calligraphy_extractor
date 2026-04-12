@@ -460,6 +460,95 @@ print(json.dumps(output, ensure_ascii=False))
 
         return best_result
 
+    @staticmethod
+    def match_chars_to_ocr_results(
+        char_bboxes: List[Tuple[int, int, int, int]],
+        ocr_results: List[Tuple[List[float], OcrResult]]
+    ) -> List[OcrResult]:
+        """
+        将多个裁切字符匹配到 OCR 结果，并拆分多字符文本
+
+        Args:
+            char_bboxes: 字符边界框列表 [(x, y, w, h), ...]
+            ocr_results: OCR 结果列表
+
+        Returns:
+            每个字符对应的 OCR 结果列表
+        """
+        if not char_bboxes:
+            return []
+
+        # 按 x 坐标排序字符
+        sorted_indices = sorted(range(len(char_bboxes)),
+                               key=lambda i: char_bboxes[i][0])
+
+        # 按 OCR 区域的 x 坐标排序
+        sorted_ocr = sorted(ocr_results,
+                           key=lambda x: (x[0][0][0] + x[0][2][0]) / 2)
+
+        # 为每个 OCR 区域，找到所有落在该区域内的字符
+        ocr_char_assignments = []  # [(ocr_result, [char_indices])]
+
+        for bbox, ocr_result in sorted_ocr:
+            ocr_x1 = min(p[0] for p in bbox)
+            ocr_x2 = max(p[0] for p in bbox)
+            ocr_y1 = min(p[1] for p in bbox)
+            ocr_y2 = max(p[1] for p in bbox)
+
+            matching_chars = []
+            for i, char_bbox in enumerate(char_bboxes):
+                cx = char_bbox[0] + char_bbox[2] / 2
+                cy = char_bbox[1] + char_bbox[3] / 2
+
+                # 检查字符中心是否在 OCR 区域内
+                if ocr_x1 <= cx <= ocr_x2 and ocr_y1 <= cy <= ocr_y2:
+                    matching_chars.append(i)
+
+            if matching_chars:
+                ocr_char_assignments.append((ocr_result, matching_chars))
+
+        # 构建结果列表
+        results = [OcrResult(text="待确认", confidence=0.0) for _ in char_bboxes]
+
+        for ocr_result, char_indices in ocr_char_assignments:
+            text = ocr_result.text
+            text_len = len(text) if text else 0
+            num_chars = len(char_indices)
+
+            if text_len == 0:
+                continue
+
+            # 计算每个字符应分配的字符数
+            if num_chars == 0:
+                continue
+
+            # 拆分文本
+            chars_per_slot = max(1, text_len // num_chars)
+            remainder = text_len % num_chars
+
+            char_idx = 0
+            for i, char_idx_in_bbox in enumerate(char_indices):
+                if char_idx >= text_len:
+                    break
+
+                # 计算这个字符应该分到的字符数
+                count = chars_per_slot + (1 if i < remainder else 0)
+                if count == 0:
+                    count = 1
+
+                # 取出一个字符（或多个如果 count > 1）
+                assigned_text = text[char_idx:char_idx + min(count, len(text) - char_idx)]
+                char_idx += len(assigned_text)
+
+                # 分配结果
+                result = OcrResult(
+                    text=assigned_text,
+                    confidence=ocr_result.confidence
+                )
+                results[char_idx_in_bbox] = result
+
+        return results
+
 
 class MetadataGenerator:
     """

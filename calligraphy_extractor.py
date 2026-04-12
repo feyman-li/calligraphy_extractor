@@ -587,12 +587,13 @@ if __name__ == "__main__":
             ocr_results = ocr_tagger.recognize_full_image(image_path)
             print(f"[*] 检测到 {len(ocr_results)} 个文本区域")
 
+            # 批量匹配 OCR 结果（支持多字符拆分）
+            char_bboxes = [r.bbox for r in extractor.results]
+            ocr_match_results = ocr_tagger.match_chars_to_ocr_results(char_bboxes, ocr_results)
+
             char_counter = 1
-            for result in extractor.results:
-                # 根据位置匹配 OCR 结果
-                ocr_result = ocr_tagger.match_char_to_ocr_result(
-                    result.bbox, ocr_results
-                )
+            for idx, result in enumerate(extractor.results):
+                ocr_result = ocr_match_results[idx]
 
                 # 生成新文件名: 作者_作品_字_序号.png
                 char_label = ocr_result.text if ocr_result.confidence > 0.5 else "待确认"
