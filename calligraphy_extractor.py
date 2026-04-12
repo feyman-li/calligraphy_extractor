@@ -106,11 +106,12 @@ class ExtractionResult:
     """单字提取结果"""
 
     def __init__(self, char_id: str, bbox: Tuple[int, int, int, int],
-                 image: np.ndarray, confidence: float = 1.0):
+                 image: np.ndarray, confidence: float = 1.0, image_path: str = ""):
         self.char_id = char_id
         self.bbox = bbox  # (x, y, w, h)
         self.image = image
         self.confidence = confidence
+        self.image_path = image_path
 
     def save(self, output_path: str) -> bool:
         try:
@@ -372,7 +373,8 @@ class CalligraphyExtractor:
                 self.results.append(ExtractionResult(
                     char_id=char_id,
                     bbox=(x, y, cw, ch),
-                    image=bgra_padded
+                    image=bgra_padded,
+                    image_path=filepath
                 ))
                 extracted_count += 1
 
@@ -514,6 +516,8 @@ if __name__ == "__main__":
 
     # OCR 自动打标参数
     parser.add_argument("--ocr", action="store_true", help="启用 OCR 自动打标")
+    parser.add_argument("--use-paddle", action="store_true", help="使用 PaddleOCR 原生模式 (自动下载模型)")
+    parser.add_argument("--easyocr", action="store_true", help="使用 EasyOCR 模式")
     parser.add_argument("--ocr-model", help="OCR ONNX 模型路径")
     parser.add_argument("--ocr-dict", help="OCR 字典文件路径")
     parser.add_argument("--author", default="未知", help="作者姓名")
@@ -537,26 +541,37 @@ if __name__ == "__main__":
     ocr_tagger = None
     metadata_gen = None
     if args.ocr:
-        if not args.ocr_model or not os.path.exists(args.ocr_model):
-            print("[!] OCR 模式需要指定有效的模型路径 (--ocr-model)")
-            print("[*] 请从 PaddleOCR 下载: https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar")
-            exit(1)
-
         try:
             from ocr_auto_tagger import OcrAutoTagger, MetadataGenerator
-            ocr_tagger = OcrAutoTagger(
-                onnx_model_path=args.ocr_model,
-                dict_path=args.ocr_dict,
-                use_opencv_dnn=True
-            )
+            if args.use_paddle:
+                # PaddleOCR 原生模式 (自动下载模型)
+                ocr_tagger = OcrAutoTagger(use_onnx=False)
+                print("[*] OCR 已启用: PaddleOCR 原生模式")
+            elif args.easyocr:
+                # EasyOCR 模式
+                ocr_tagger = OcrAutoTagger(use_easyocr=True)
+                print("[*] OCR 已启用: EasyOCR 模式")
+            elif args.ocr_model and os.path.exists(args.ocr_model):
+                # ONNX 模式
+                ocr_tagger = OcrAutoTagger(
+                    model_path=args.ocr_model,
+                    dict_path=args.ocr_dict,
+                    use_onnx=True,
+                    use_opencv_dnn=True
+                )
+                print(f"[*] OCR 已启用: {args.ocr_model}")
+            else:
+                print("[!] OCR 模式需要指定 --use-paddle, --easyocr 或 --ocr-model <模型路径>")
+                print("[*] 推荐使用 --easyocr (需安装: pip install easyocr)")
+                print("[*] 或使用 --use-paddle 自动下载 PaddleOCR 模型")
+                exit(1)
             metadata_gen = MetadataGenerator(
                 author=args.author,
                 work_name=args.work,
                 output_dir=args.output
             )
-            print(f"[*] OCR 已启用: {args.ocr_model}")
-        except ImportError:
-            print("[!] 请安装 onnxruntime: pip install onnxruntime")
+        except ImportError as e:
+            print(f"[!] OCR 模块导入失败: {e}")
             exit(1)
 
     # 判断输入是文件还是目录
@@ -567,10 +582,17 @@ if __name__ == "__main__":
         count = extractor.process_image(image_path, save_original_color=save_color)
 
         if ocr_tagger and metadata_gen:
+            # 对整张图像运行 OCR
+            print("[*] 正在识别整幅图像文字...")
+            ocr_results = ocr_tagger.recognize_full_image(image_path)
+            print(f"[*] 检测到 {len(ocr_results)} 个文本区域")
+
             char_counter = 1
             for result in extractor.results:
-                # OCR 识别
-                ocr_result = ocr_tagger.recognize(result.image)
+                # 根据位置匹配 OCR 结果
+                ocr_result = ocr_tagger.match_char_to_ocr_result(
+                    result.bbox, ocr_results
+                )
 
                 # 生成新文件名: 作者_作品_字_序号.png
                 char_label = ocr_result.text if ocr_result.confidence > 0.5 else "待确认"

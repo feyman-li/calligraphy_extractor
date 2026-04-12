@@ -103,19 +103,31 @@ class OcrAutoTagger:
                 self.input_name = self.session.get_inputs()[0].name
                 self.use_opencv = False
         else:
-            # PaddleOCR 原生模式
-            try:
-                from paddleocr import PaddleOCR
-                self.paddle_ocr = PaddleOCR(
-                    lang=lang,
-                    show_log=False
-                )
+            # PaddleOCR 原生模式 - 优先使用 venv_paddle 中的版本
+            import sys
+            # 获取脚本所在目录的父目录
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            venv_python = os.path.join(script_dir, 'venv_paddle', 'Scripts', 'python.exe')
+
+            if os.path.exists(venv_python):
+                # 使用 venv_paddle 中的 Python
+                self.paddle_ocr = None
+                self.venv_python = venv_python
                 self.use_opencv = False
                 self.session = None
-            except ImportError:
-                raise ImportError(
-                    "PaddleOCR 未安装。请运行: pip install paddleocr paddlepaddle"
-                )
+            else:
+                # 回退到系统 Python
+                try:
+                    from paddleocr import PaddleOCR
+                    self.paddle_ocr = PaddleOCR(
+                        lang=lang,
+                        use_angle_cls=False
+                    )
+                    self.venv_python = None
+                except ImportError:
+                    raise ImportError(
+                        "PaddleOCR 未安装。请运行: pip install paddleocr paddlepaddle"
+                    )
 
     def _load_dict(self, dict_path: str):
         """加载字典文件"""
@@ -289,6 +301,164 @@ class OcrAutoTagger:
     def recognize_batch(self, char_imgs: List[np.ndarray]) -> List[OcrResult]:
         """批量识别"""
         return [self.recognize(img) for img in char_imgs]
+
+    def recognize_full_image(self, image_path: str) -> List[Tuple[List[float], OcrResult]]:
+        """
+        对整张图像进行 OCR 识别，返回所有检测到的文本区域
+
+        Args:
+            image_path: 图像文件路径
+
+        Returns:
+            List of ((bbox_points), OcrResult) tuples for each detected text region
+        """
+        if self.use_easyocr:
+            return self._recognize_full_easyocr(image_path)
+        elif self.use_onnx:
+            # ONNX 模式需要外部提供全图 OCR，这里返回空
+            return []
+        else:
+            return self._recognize_full_paddle(image_path)
+
+    def _recognize_full_paddle(self, image_path: str) -> List[Tuple[List[float], OcrResult]]:
+        """PaddleOCR 全图识别"""
+        try:
+            # 如果有 venv_python，使用 subprocess 调用
+            if self.venv_python:
+                return self._recognize_full_paddle_subprocess(image_path)
+
+            # 否则直接使用导入的 paddle_ocr
+            result = self.paddle_ocr.ocr(image_path)
+            if not result or not result[0]:
+                return []
+
+            ocr_results = []
+            for line in result[0]:
+                bbox = line[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                text = line[1][0] if line[1][0] else "未知"
+                confidence = float(line[1][1]) if line[1][1] else 0.0
+                ocr_results.append((bbox, OcrResult(text=text, confidence=confidence)))
+            return ocr_results
+        except Exception as e:
+            return []
+
+    def _recognize_full_paddle_subprocess(self, image_path: str) -> List[Tuple[List[float], OcrResult]]:
+        """使用 venv_paddle 中的 PaddleOCR 进行全图识别"""
+        import subprocess
+        import json as json_module
+
+        script = '''
+import sys
+import os
+# 抑制 PaddlePaddle 的 warning 日志
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+from paddleocr import PaddleOCR
+import json
+
+# 完全禁用日志
+import logging
+logging.disable(logging.CRITICAL)
+
+ocr = PaddleOCR(lang='ch', show_log=False)
+result = ocr.ocr(sys.argv[1])
+
+output = []
+if result and result[0]:
+    for line in result[0]:
+        bbox = [[float(p[0]), float(p[1])] for p in line[0]]
+        text = line[1][0] if line[1][0] else "未知"
+        conf = float(line[1][1]) if line[1][1] else 0.0
+        output.append({"bbox": bbox, "text": text, "confidence": conf})
+
+print(json.dumps(output, ensure_ascii=False))
+'''
+
+        try:
+            result = subprocess.run(
+                [self.venv_python, '-c', script, image_path],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                return []
+
+            # 解析 JSON（忽略 stderr 中的警告）
+            json_str = result.stdout.strip()
+            # 如果 stdout 开头有日志行，尝试找到 JSON 部分
+            if not json_str.startswith('['):
+                # 找到第一个 '[' 的位置
+                idx = json_str.find('[')
+                if idx >= 0:
+                    json_str = json_str[idx:]
+                else:
+                    return []
+
+            data = json_module.loads(json_str)
+            return [(item["bbox"], OcrResult(text=item["text"], confidence=item["confidence"])) for item in data]
+        except Exception as e:
+            return []
+
+    def _recognize_full_easyocr(self, image_path: str) -> List[Tuple[List[float], OcrResult]]:
+        """EasyOCR 全图识别"""
+        try:
+            result = self.easyocr_reader.readtext(image_path)
+            if not result:
+                return []
+
+            import re
+            ocr_results = []
+            for line in result:
+                bbox = line[0]
+                text = line[1]
+                confidence = float(line[2])
+                # 只保留汉字
+                chinese_chars = re.findall(r'[\u4e00-\u9fff]', text)
+                clean_text = ''.join(chinese_chars) if chinese_chars else "待确认"
+                ocr_results.append((bbox, OcrResult(text=clean_text, confidence=confidence)))
+            return ocr_results
+        except Exception as e:
+            return []
+
+    @staticmethod
+    def match_char_to_ocr_result(char_bbox: Tuple[int, int, int, int],
+                                 ocr_results: List[Tuple[List[float], OcrResult]],
+                                 iou_threshold: float = 0.3) -> OcrResult:
+        """
+        将裁切字符匹配到 OCR 结果
+
+        Args:
+            char_bbox: 字符边界框 (x, y, w, h)
+            ocr_results: OCR 结果列表
+            iou_threshold: IoU 阈值
+
+        Returns:
+            匹配的 OCR 结果，如果无匹配则返回默认结果
+        """
+        cx = char_bbox[0] + char_bbox[2] / 2
+        cy = char_bbox[1] + char_bbox[3] / 2
+
+        best_iou = iou_threshold
+        best_result = OcrResult(text="待确认", confidence=0.0)
+
+        for bbox, ocr_result in ocr_results:
+            # bbox 是四个角点 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+            # 计算 OCR 区域的中心点
+            ocr_cx = (bbox[0][0] + bbox[2][0]) / 2
+            ocr_cy = (bbox[0][1] + bbox[2][1]) / 2
+
+            # 计算距离
+            dist = ((cx - ocr_cx) ** 2 + (cy - ocr_cy) ** 2) ** 0.5
+
+            # 如果距离在字符宽度的一半内，认为匹配
+            char_diag = (char_bbox[2] ** 2 + char_bbox[3] ** 2) ** 0.5
+            if dist < char_diag * 1.5:  # 允许一些容差
+                if ocr_result.confidence > best_result.confidence:
+                    best_result = ocr_result
+
+        return best_result
 
 
 class MetadataGenerator:

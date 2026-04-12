@@ -14,3 +14,9 @@ Thumbs.db
 # Python virtual environments
 venv_paddle/
 venv/
+
+# Temporary files
+_temp_paddle_*.png
+_debug_*.png
+_test_*.png
+*.jpg
