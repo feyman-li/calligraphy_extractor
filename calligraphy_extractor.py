@@ -582,28 +582,27 @@ if __name__ == "__main__":
         count = extractor.process_image(image_path, save_original_color=save_color)
 
         if ocr_tagger and metadata_gen:
-            # 对整张图像运行 OCR
+            # 对整张图像运行 OCR（仅用于元数据记录）
             print("[*] 正在识别整幅图像文字...")
             ocr_results = ocr_tagger.recognize_full_image(image_path)
             print(f"[*] 检测到 {len(ocr_results)} 个文本区域")
 
-            # 批量匹配 OCR 结果（支持多字符拆分）
-            char_bboxes = [r.bbox for r in extractor.results]
-            ocr_match_results = ocr_tagger.match_chars_to_ocr_results(char_bboxes, ocr_results)
-
+            # 匹配 OCR 结果（用于元数据）
             char_counter = 1
-            for idx, result in enumerate(extractor.results):
-                ocr_result = ocr_match_results[idx]
+            for result in extractor.results:
+                # 查找最近的 OCR 结果
+                ocr_result = ocr_tagger.match_char_to_ocr_result(
+                    result.bbox, ocr_results
+                )
 
-                # 生成新文件名: 作者_作品_字_序号.png
-                char_label = ocr_result.text if ocr_result.confidence > 0.5 else "待确认"
-                new_basename = f"{args.author}_{args.work}_{char_label}_{char_counter:03d}"
+                # 文件名使用序号，不使用 OCR 文本
+                new_basename = f"{args.author}_{args.work}_{char_counter:03d}"
                 char_counter += 1
 
                 # 更新结果中的文件名
                 result.char_id = new_basename
 
-                # 生成元数据
+                # 生成元数据（OCR 结果记录在 JSON 中）
                 metadata = metadata_gen.generate(
                     char_img=result.image,
                     ocr_result=ocr_result,
