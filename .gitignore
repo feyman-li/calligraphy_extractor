@@ -10,3 +10,7 @@ Thumbs.db
 *.o
 *.obj
 *.exe
+
+# Python virtual environments
+venv_paddle/
+venv/

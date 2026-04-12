@@ -107,9 +107,7 @@ class OcrAutoTagger:
             try:
                 from paddleocr import PaddleOCR
                 self.paddle_ocr = PaddleOCR(
-                    use_angle_cls=True,
                     lang=lang,
-                    use_gpu=False,
                     show_log=False
                 )
                 self.use_opencv = False
@@ -224,26 +222,35 @@ class OcrAutoTagger:
         if len(char_img.shape) == 2:
             char_img = cv2.cvtColor(char_img, cv2.COLOR_GRAY2BGR)
 
-        # PaddleOCR 需要图像路径，暂存到临时文件
-        temp_path = '_temp_char_img.png'
-        cv2.imwrite(temp_path, char_img)
-
         try:
+            # 放大图像 (PaddleOCR 对小图像支持不好，统一放大3倍)
+            h, w = char_img.shape[:2]
+            scale = 3
+            char_img = cv2.resize(char_img, (w * scale, h * scale))
+
+            # 保存临时文件 (使用唯一名称避免冲突)
+            import uuid
+            temp_path = f'_temp_paddle_{uuid.uuid4().hex[:8]}.png'
+            cv2.imwrite(temp_path, char_img)
+
             result = self.paddle_ocr.ocr(temp_path)
 
-            if result and result[0] and len(result[0]) > 0:
+            os.remove(temp_path)
+
+            if result and len(result) > 0 and result[0] and len(result[0]) > 0:
                 # PaddleOCR 返回格式: [[bbox, (text, confidence)]]
                 text = result[0][0][1][0] if result[0][0] else "未知"
                 confidence = result[0][0][1][1] if result[0][0] else 0.0
+
+                # 清理文本
+                text = text.strip() if text else "未知"
+
                 return OcrResult(text=text, confidence=float(confidence))
             else:
                 return OcrResult(text="未知", confidence=0.0)
+
         except Exception as e:
-            # PaddleOCR 可能因环境问题失败，标记为需要人工确认
             return OcrResult(text="待确认", confidence=0.0)
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
 
     def _recognize_easyocr(self, char_img: np.ndarray) -> OcrResult:
         """EasyOCR 模式识别"""
